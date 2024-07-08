@@ -20,6 +20,14 @@ class TranslateStack(Stack):
                            removal_policy=RemovalPolicy.DESTROY,
                            auto_delete_objects=True)
 
+        # Preprocess task to extract and format the job name
+        preprocess_task = sfn.Pass(self, "Preprocess",
+            parameters={
+                "TranscriptionJobName.$": "States.Format('{}_job', $.requestParameters.key)",
+                "OriginalKey.$": "$.requestParameters.key"
+            }
+        )
+
         # Transcribe task
         transcribe_task = tasks.CallAwsService(self, "Transcribe",
             service="transcribe",
@@ -27,7 +35,7 @@ class TranslateStack(Stack):
             parameters={
                 "TranscriptionJobName.$": "$.TranscriptionJobName",
                 "Media": {
-                    "MediaFileUri.$": "States.Format('s3://{}/{}', '" + bucket.bucket_name + "', $.requestParameters.key)"
+                    "MediaFileUri.$": "States.Format('s3://{}/{}', '" + bucket.bucket_name + "', $.OriginalKey)"
                 },
                 "OutputBucketName": bucket.bucket_name,
                 "OutputKey.$": "States.Format('transcriptions/{}.json', $.TranscriptionJobName)",
@@ -79,7 +87,8 @@ class TranslateStack(Stack):
 
         # Define Step Functions Workflow
         workflow_definition = (
-            transcribe_task
+            preprocess_task
+            .next(transcribe_task)
             .next(check_language_task
                 .when(is_english, sfn.Pass(self, "Skip Translation"))
                 .otherwise(translate_task.next(polly_task).next(save_to_s3_task))
