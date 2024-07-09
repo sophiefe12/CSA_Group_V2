@@ -5,6 +5,7 @@ from aws_cdk import (
     aws_stepfunctions as sfn,
     aws_stepfunctions_tasks as tasks,
     aws_iam as iam,
+    Duration,
     Stack,
     RemovalPolicy,
 )
@@ -41,23 +42,56 @@ class TranslateStack(Stack):
                 "OutputKey.$": "States.Format('transcriptions/{}.json', $.TranscriptionJobName)",
                 "IdentifyLanguage": True
             },
-            iam_resources=["*"]
+            iam_resources=["*"],
+            result_path="$.TranscriptionResult"
+        )
+
+        # Wait for a few seconds before checking the job status
+        wait_task = sfn.Wait(self, "WaitForTranscription",
+            time=sfn.WaitTime.duration(Duration.seconds(30))
+        )
+
+        # Get Transcription Job status task
+        get_transcription_task = tasks.CallAwsService(self, "GetTranscriptionJob",
+            service="transcribe",
+            action="getTranscriptionJob",
+            parameters={
+                "TranscriptionJobName.$": "$.TranscriptionJobName"
+            },
+            iam_resources=["*"],
+            result_path="$.GetTranscriptionResult"
+        )
+
+        # Check if transcription job is complete
+        check_status_task = sfn.Choice(self, "CheckJobStatus")
+        is_completed = sfn.Condition.string_equals("$.GetTranscriptionResult.TranscriptionJob.TranscriptionJobStatus", "COMPLETED")
+        is_in_progress = sfn.Condition.string_equals("$.GetTranscriptionResult.TranscriptionJob.TranscriptionJobStatus", "IN_PROGRESS")
+
+        # Define a pass state to loop back to wait
+        loop_back_pass = sfn.Pass(self, "LoopBackPass")
+
+        # Capture transcription result
+        capture_transcription_result = sfn.Pass(self, "CaptureTranscriptionResult",
+            parameters={
+                "TranscriptionResult.$": "$.GetTranscriptionResult"
+            }
         )
 
         # Check Language Task
         check_language_task = sfn.Choice(self, "Check Language")
-        is_english = sfn.Condition.string_equals("$.TranscriptionJob.LanguageCode", "en-US")
+        is_english = sfn.Condition.string_equals("$.TranscriptionResult.TranscriptionJob.LanguageCode", "en-US")
 
         # Translate task
         translate_task = tasks.CallAwsService(self, "Translate",
             service="translate",
             action="translateText",
             parameters={
-                "Text.$": "$.TranscriptionJob.Transcript",
-                "SourceLanguageCode.$": "$.TranscriptionJob.LanguageCode",
+                "Text.$": "$.TranscriptionResult.TranscriptionJob.Transcript",
+                "SourceLanguageCode.$": "$.TranscriptionResult.TranscriptionJob.LanguageCode",
                 "TargetLanguageCode": "en"
             },
-            iam_resources=["*"]
+            iam_resources=["*"],
+            result_path="$.TranslationResult"
         )
 
         # Polly task
@@ -66,7 +100,7 @@ class TranslateStack(Stack):
             action="synthesizeSpeech",
             parameters={
                 "OutputFormat": "mp3",
-                "Text.$": "$.TranslateText.TranslatedText",
+                "Text.$": "$.TranslationResult.TranslatedText",
                 "VoiceId": "Joanna"
             },
             result_path="$.pollyResult",
@@ -89,20 +123,29 @@ class TranslateStack(Stack):
         workflow_definition = (
             preprocess_task
             .next(transcribe_task)
-            .next(check_language_task
-                .when(is_english, sfn.Pass(self, "Skip Translation"))
-                .otherwise(translate_task.next(polly_task).next(save_to_s3_task))
+            .next(wait_task)
+            .next(get_transcription_task)
+            .next(check_status_task
+                .when(is_completed, capture_transcription_result
+                    .next(check_language_task
+                        .when(is_english, sfn.Pass(self, "Skip Translation"))
+                        .otherwise(translate_task.next(polly_task).next(save_to_s3_task))
+                    )
+                )
+                .when(is_in_progress, loop_back_pass.next(wait_task))
+                .otherwise(sfn.Fail(self, "TranscriptionFailed", error="TranscriptionJobFailed"))
             )
         )
 
         # Create Step Functions State Machine
         state_machine = sfn.StateMachine(self, "TranslationStateMachine",
-            definition=workflow_definition
+            definition=workflow_definition,
+            timeout=Duration.minutes(10)  # Adjust the timeout as necessary
         )
 
         # Attach policies to the state machine role
         state_machine.role.add_to_policy(iam.PolicyStatement(
-            actions=["transcribe:StartTranscriptionJob"],
+            actions=["transcribe:StartTranscriptionJob", "transcribe:GetTranscriptionJob"],
             resources=["*"]
         ))
         state_machine.role.add_to_policy(iam.PolicyStatement(
@@ -140,4 +183,3 @@ class TranslateStack(Stack):
         )
 
         rule.add_target(targets.SfnStateMachine(state_machine))
-
